@@ -1,0 +1,86 @@
+variables:
+  SECURE_FILES_DOWNLOAD_PATH: './'
+  STAGE_BRANCH: staging
+  PROD_BRANCH: main
+
+
+stages:
+  - test
+  - deploy
+
+default:
+  image: python:3.9
+  cache:
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - '$CI_PROJECT_DIR/.cache/pip'
+    policy: pull-push
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $STAGE_BRANCH || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $STAGE_BRANCH
+      variables:
+        API_VERSION: staging
+        ENV_FILE: .env.staging
+    - if: $CI_COMMIT_BRANCH == $PROD_BRANCH || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $PROD_BRANCH
+      variables:
+        API_VERSION: galileo-api
+        ENV_FILE: .env.production
+    - when: always
+
+.load_secure_env_files: &load_secure_env_files
+  - curl --silent "https://gitlab.com/gitlab-org/incubation-engineering/mobile-devops/load-secure-files/-/raw/main/installer" | bash
+
+.cleanup_env_files: &cleanup_env_files
+  - rm .env*
+
+.install_gcloud_sdk: &install_gcloud_sdk
+  - curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+  - echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+  - apt-get update && apt-get install -y google-cloud-cli
+
+.install_requirements: &install_requirements
+  - pip3 install -r monthly_report/requirements.txt
+
+.setup_google_cred_account: &setup_google_cred_account
+  - export GOOGLE_APPLICATION_CREDENTIALS=app_credentials.json # Google Cloud service accounts
+
+flask_tests:
+  stage: test
+  rules:
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $PROD_BRANCH
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $STAGE_BRANCH
+  before_script:
+    - *load_secure_env_files
+    - *install_requirements
+    - *setup_google_cred_account
+  script:
+    - cp $ENV_FILE .env
+    - echo "$GCP_PROJECT_ID" 
+    - coverage run -m pytest monthly_report
+    - coverage report
+  environment:
+    name: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+  after_script:
+    - *cleanup_env_files
+
+deploy:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $PROD_BRANCH
+    - if: $CI_COMMIT_BRANCH == $STAGE_BRANCH
+  variables:
+    TRAMPOLINE_CI: ''
+  before_script:
+    - *install_gcloud_sdk
+    - *load_secure_env_files
+  script:
+    - cp $ENV_FILE .env
+    - echo "$GCP_PROJECT_ID" 
+    - gcloud auth activate-service-account --key-file app_credentials.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud builds submit
+  after_script:
+    - *cleanup_env_files
+  environment:
+    name: $CI_COMMIT_BRANCH
